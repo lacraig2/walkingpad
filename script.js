@@ -298,13 +298,7 @@ el.c.onclick=async()=>{
 
       // --- Elapsed time handling (with observed rollovers + attach-time inference) ---
       if (typeof pkt.elapsedTimeS === 'number'){
-        // Treat implausible startup elapsed (near wrap, zero distance) as zero
-        const scaledDistForStaleCheck = (typeof pkt.totalDistanceM === 'number' ? pkt.totalDistanceM * getDistanceScale() : totalDist);
-        let rawS = pkt.elapsedTimeS;
-        if (!running && elapsedWrapOffsetS === 0 && prevRawElapsedS === 0 && scaledDistForStaleCheck < 5 && rawS > ELAPSED_WRAP_THRESHOLD_HIGH) {
-          log(`Reset stale elapsed from device start (${formatHMS(rawS)})`);
-          rawS = 0;
-        }
+        const rawS = pkt.elapsedTimeS;
 
         // NEW: remember latest raw for later reconciliation/estimation
         lastRawElapsedSeenS = rawS;
@@ -437,45 +431,58 @@ el.importBtn.onclick=()=>el.importFile.click();
 el.importFile.onchange=async e=>{ const f=e.target.files[0]; if(!f) return; const text=await f.text(); const incoming=JSON.parse(text); const existing=loadSessions(); const merged=[...existing,...incoming]; saveSessions(merged); renderSessions(); updateChart(); updateSummary(); e.target.value=''; };
 
 // --- Charts & summary ---
-// chartMetric: 'distance' | 'steps' | 'calories'
-let chartMetric = 'distance';
+function groupSessions(period) {
+  const sessions = loadSessions();
+  const buckets = {};
 
-// aggregate sessions by period ('day'|'week'|'month'|'year') and chosen metric
-function groupSessions(period, metric){
-  const s = loadSessions();
-  const b = {};
-  s.forEach(x=>{
-    const d = new Date(x.time);
-    let k = '';
-    switch(period){
-      case 'day': k = d.toLocaleDateString(); break;
-      case 'week': k = 'Week ' + Math.ceil((((d - new Date(d.getFullYear(),0,1)) / 86400000) + d.getDay() + 1) / 7) + ' - ' + d.getFullYear(); break;
-      case 'month': k = d.toLocaleString('default',{month:'short'}) + ' ' + d.getFullYear(); break;
-      case 'year': k = d.getFullYear(); break;
+  sessions.forEach(session => {
+    const date = new Date(session.time);
+    let key = '';
+
+    switch (period) {
+      case 'day':
+        key = date.toLocaleDateString();
+        break;
+      case 'week':
+        // Calculation for week number
+        const startOfYear = new Date(date.getFullYear(), 0, 1);
+        const pastDays = (date - startOfYear) / 86400000;
+        const weekNum = Math.ceil((pastDays + startOfYear.getDay() + 1) / 7);
+        key = 'Week ' + weekNum + ' - ' + date.getFullYear();
+        break;
+      case 'month':
+        key = date.toLocaleString('default', { month: 'short' }) + ' ' + date.getFullYear();
+        break;
+      case 'year':
+        key = date.getFullYear();
+        break;
     }
-    let val = 0;
-    if (metric === 'distance') val = parseFloat(x.distance) || 0;
-    else if (metric === 'steps') val = parseInt(x.steps) || 0;
-    else if (metric === 'calories') val = parseFloat(x.calories) || 0;
-    b[k] = (b[k] || 0) + val;
+
+    buckets[key] = (buckets[key] || 0) + parseFloat(session.distance);
   });
-  return { labels: Object.keys(b), data: Object.values(b) };
+
+  return {
+    labels: Object.keys(buckets),
+    data: Object.values(buckets)
+  };
 }
 
-function updateChart(){
+function updateChart() {
   const ctx = document.getElementById('distanceChart').getContext('2d');
-  const period = 'day';
-  const g = groupSessions(period, chartMetric);
-  if (chart) chart.destroy();
-  const labelMap = { distance: 'Cumulative Distance', steps: 'Cumulative Steps', calories: 'Cumulative Calories' };
-  const yTitleMap = { distance: 'Miles', steps: 'Steps', calories: 'Calories' };
+  const period = 'day'; // Default view
+  const graphData = groupSessions(period);
+
+  if (chart) {
+    chart.destroy();
+  }
+
   chart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: g.labels,
+      labels: graphData.labels,
       datasets: [{
-        label: labelMap[chartMetric],
-        data: g.data,
+        label: 'Cumulative Distance',
+        data: graphData.data,
         borderColor: '#3b82f6',
         backgroundColor: 'rgba(59,130,246,0.2)',
         fill: true,
@@ -487,42 +494,18 @@ function updateChart(){
       scales: {
         y: {
           beginAtZero: true,
-          title: { display: true, text: yTitleMap[chartMetric] }
+          title: {
+            display: true,
+            text: 'Miles'
+          }
         }
       }
     }
   });
+
   el.summary.textContent = '';
   updateSummary();
 }
-
-// metric toggle handlers
-el.metricDistance = document.getElementById('metricDistance');
-el.metricSteps = document.getElementById('metricSteps');
-el.metricCalories = document.getElementById('metricCalories');
-function setMetric(m){
-  chartMetric = m;
-  // update button styles (simple)
-  ['Distance','Steps','Calories'].forEach(name=>{
-    const id = 'metric' + name;
-    const btn = document.getElementById(id);
-    if (!btn) return;
-    if (name.toLowerCase() === m) {
-      btn.classList.add('bg-blue-500','text-white');
-      btn.classList.remove('bg-gray-200','text-gray-700');
-    } else {
-      btn.classList.remove('bg-blue-500','text-white');
-      btn.classList.add('bg-gray-200','text-gray-700');
-    }
-  });
-  updateChart();
-}
-el.metricDistance.addEventListener('click', ()=>setMetric('distance'));
-el.metricSteps.addEventListener('click', ()=>setMetric('steps'));
-el.metricCalories.addEventListener('click', ()=>setMetric('calories'));
-
-// initialize metric UI state
-setMetric('distance');
 
 // --- NEW: Summary totals ---
 function updateSummary() {
@@ -537,36 +520,28 @@ function updateSummary() {
   monday.setHours(0,0,0,0);
   monday.setDate(now.getDate() - ((now.getDay() + 6) % 7)); // Monday as start
 
-  // Pick metric field and formatting
-  let metricField = 'distance', label = 'mi', fmt = v => Number(v).toFixed(2);
-  if (chartMetric === 'steps') { metricField = 'steps'; label = 'steps'; fmt = v => Number(v).toLocaleString(); }
-  if (chartMetric === 'calories') { metricField = 'calories'; label = 'cal'; fmt = v => Number(v).toFixed(2); }
-
   sessions.forEach(s => {
     const d = new Date(s.time);
-    let val = 0;
-    if (metricField === 'distance') val = parseFloat(s.distance) || 0;
-    else if (metricField === 'steps') val = parseInt(s.steps) || 0;
-    else if (metricField === 'calories') val = parseFloat(s.calories) || 0;
+    const dist = parseFloat(s.distance) || 0;
     // Today
-    if (d.toLocaleDateString() === todayStr) today += val;
+    if (d.toLocaleDateString() === todayStr) today += dist;
     // This week (starting Monday)
     const weekStart = new Date(d);
     weekStart.setHours(0,0,0,0);
     weekStart.setDate(d.getDate() - ((d.getDay() + 6) % 7));
-    if (weekStart.getTime() === monday.getTime()) week += val;
+    if (weekStart.getTime() === monday.getTime()) week += dist;
     // This month
-    if (d.getFullYear() === yearNum && d.getMonth() === monthNum) month += val;
+    if (d.getFullYear() === yearNum && d.getMonth() === monthNum) month += dist;
     // This year
-    if (d.getFullYear() === yearNum) year += val;
+    if (d.getFullYear() === yearNum) year += dist;
   });
 
   el.summary.innerHTML = `
     <div class="grid grid-cols-2 gap-2 text-lg">
-      <div><span class="font-bold">Today:</span> ${fmt(today)} ${label}</div>
-      <div><span class="font-bold">This Week:</span> ${fmt(week)} ${label}</div>
-      <div><span class="font-bold">This Month:</span> ${fmt(month)} ${label}</div>
-      <div><span class="font-bold">This Year:</span> ${fmt(year)} ${label}</div>
+      <div><span class="font-bold">Today:</span> ${today.toFixed(2)} mi</div>
+      <div><span class="font-bold">This Week:</span> ${week.toFixed(2)} mi</div>
+      <div><span class="font-bold">This Month:</span> ${month.toFixed(2)} mi</div>
+      <div><span class="font-bold">This Year:</span> ${year.toFixed(2)} mi</div>
     </div>
   `;
 }
