@@ -11,6 +11,10 @@ const ELAPSED_WRAP_13S = 8192;                    // seconds in 13-bit counter (
 const ELAPSED_WRAP_THRESHOLD_HIGH = 7000;         // consider "near max" if prev raw > 7000 s
 const ELAPSED_WRAP_THRESHOLD_LOW  = 200;          // consider "near zero" if new raw < 200 s
 
+// --- Saving Constraints ---
+const MIN_DIST_TO_SAVE_MILES = 0.05;    // Ignore sessions shorter than this
+const MERGE_WINDOW_MS = 60 * 1000;      // 60 seconds: if saving again within this window, update previous
+
 function milesFromMeters(m){
   // includes user distance scaling
   return (m * getDistanceScale()) / M_PER_MI;
@@ -21,7 +25,7 @@ function milesFromMeters(m){
  * We know the device physically cannot go faster than MAX_SPEED or slower than MIN_SPEED.
  * We calculate the "Time Required" to go the reported Distance at those speeds.
  * * Min Time Possible = Distance / MAX_SPEED
- * Max Time Possible = Distance / MIN_SPEED
+ * * Max Time Possible = Distance / MIN_SPEED
  * * The true elapsed time (Raw + Wraps*8192) MUST fall between Min Time and Max Time.
  * We find the integer 'Wraps' that satisfies this condition.
  */
@@ -428,9 +432,54 @@ el.dn.onclick=async()=>{ if(!connected) return; let v=parseFloat(el.t.value)||0;
 // --- Sessions ---
 function loadSessions(){ try { return JSON.parse(localStorage.getItem('walkingpad_sessions')||'[]'); } catch(e){ return []; } }
 function saveSessions(a){ localStorage.setItem('walkingpad_sessions', JSON.stringify(a)); }
+
 function saveSession(){
-  const miles=totalDist/M_PER_MI;
-  if(miles>0){ const s=loadSessions(); s.push({ time:new Date().toISOString(), duration:el.elapsed.textContent, distance:miles.toFixed(2), steps:steps, calories:calories.toFixed(2) }); saveSessions(s); renderSessions(); updateChart(); }
+  const miles = totalDist / M_PER_MI;
+
+  // 1. Threshold Check: Ignore noise/accidental starts < 0.05 miles
+  if (miles < MIN_DIST_TO_SAVE_MILES) {
+      // Just reset state without saving
+      resetSessionState();
+      return;
+  }
+
+  const sessions = loadSessions();
+  const now = new Date();
+  const newEntry = { 
+      time: now.toISOString(), 
+      duration: el.elapsed.textContent, 
+      distance: miles.toFixed(2), 
+      steps: steps, 
+      calories: calories.toFixed(2) 
+  };
+
+  // 2. Merge Check: If the last session was saved very recently (e.g. within 60s),
+  // overwrite it instead of creating a new entry.
+  let merged = false;
+  if (sessions.length > 0) {
+      const lastSession = sessions[sessions.length - 1];
+      const lastTime = new Date(lastSession.time).getTime();
+      const timeDiff = now.getTime() - lastTime;
+      
+      if (timeDiff < MERGE_WINDOW_MS) {
+          sessions[sessions.length - 1] = newEntry; // Overwrite
+          merged = true;
+          log('Merged session with previous record (updated data)');
+      }
+  }
+
+  if (!merged) {
+      sessions.push(newEntry);
+  }
+
+  saveSessions(sessions);
+  renderSessions(); 
+  updateChart();
+  
+  resetSessionState();
+}
+
+function resetSessionState() {
   totalDist=0; steps=0; calories=0; baseMs=0; startMs=0; lastBleTs=0; elapsedWrapOffsetS=0; prevRawElapsedS=0; lastComputeAt=Date.now();
   // NEW resets
   initialWrapGuessed=false; lastRawElapsedSeenS=0;
