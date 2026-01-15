@@ -1,9 +1,9 @@
 // --- BLE & constants ---
 const FTMS_SERVICE = 0x1826, FTMS_CP = 0x2AD9, FTMS_DATA = 0x2ACD;
 const REQ_CONTROL = Uint8Array.from([0x00]), START_CMD = Uint8Array.from([0x07]), PAUSE_CMD = Uint8Array.from([0x08,0x02]), STOP_CMD = Uint8Array.from([0x08,0x01]);
-const mphToUnits = m => Math.round(m * 160), MIN_SPEED = 0.6, MAX_SPEED = 3.8;
+const mphToUnits = m => Math.round(m * 160), MIN_SPEED = 0.6, MAX_SPEED = 3.8; // Hardware limits
 const M_PER_MI = 1609.34;
-const RESERVED_BIT13 = 0x2000; // observed with zeroed packets
+const RESERVED_BIT13 = 0x2000; 
 const MAX_REASONABLE_KPH = 30;
 
 // --- 13-bit elapsed-time wrap constants (device quirk) ---
@@ -11,79 +11,94 @@ const ELAPSED_WRAP_13S = 8192;                    // seconds in 13-bit counter (
 const ELAPSED_WRAP_THRESHOLD_HIGH = 7000;         // consider "near max" if prev raw > 7000 s
 const ELAPSED_WRAP_THRESHOLD_LOW  = 200;          // consider "near zero" if new raw < 200 s
 
-// --- NEW: Avg-speed consistency helpers ---
-const AVG_SPEED_EPS = 0.05; // mph tolerance for reconciliation nudges
-
 function milesFromMeters(m){
   // includes user distance scaling
   return (m * getDistanceScale()) / M_PER_MI;
 }
 
 /**
- * Given distance (raw meters), raw elapsed seconds (0..8191), and instantaneous mph (if any),
- * return W >= 0 so that avg speed = D / ((raw + W*8192)/3600) is within [MIN_SPEED, MAX_SPEED].
- * If mph is known, pick W that gets avg closest to mph while honoring bounds.
+ * STRICT ESTIMATION:
+ * We know the device physically cannot go faster than MAX_SPEED or slower than MIN_SPEED.
+ * We calculate the "Time Required" to go the reported Distance at those speeds.
+ * * Min Time Possible = Distance / MAX_SPEED
+ * Max Time Possible = Distance / MIN_SPEED
+ * * The true elapsed time (Raw + Wraps*8192) MUST fall between Min Time and Max Time.
+ * We find the integer 'Wraps' that satisfies this condition.
  */
-function estimateWrapsFor(distanceM, rawElapsedS, mph){
+function estimateWrapsFor(distanceM, rawElapsedS, currentMph){
   const Dmi = milesFromMeters(distanceM);
-  if (!isFinite(Dmi) || Dmi <= 0 || !isFinite(rawElapsedS) || rawElapsedS < 0) return 0;
+  
+  // Garbage data checks
+  if (!isFinite(Dmi) || Dmi <= 0.01 || !isFinite(rawElapsedS) || rawElapsedS < 0) return 0;
 
-  // Times (sec) to cover D at the legal extremes
-  const tAtMax = (Dmi / MAX_SPEED) * 3600; // minimum time allowed (fastest)
-  const tAtMin = (Dmi / MIN_SPEED) * 3600; // maximum time allowed (slowest)
+  // 1. Calculate the time window physically required to cover this distance
+  // Fast limit: The shortest time possible (running at max speed)
+  const minTimeSec = (Dmi / MAX_SPEED) * 3600; 
+  
+  // Slow limit: The longest time possible (walking at min speed)
+  const maxTimeSec = (Dmi / MIN_SPEED) * 3600;
 
-  // Integer wrap bounds that make elapsed in [tAtMax, tAtMin]
-  let wMin = Math.ceil((tAtMax - rawElapsedS) / ELAPSED_WRAP_13S);
-  let wMax = Math.floor((tAtMin - rawElapsedS) / ELAPSED_WRAP_13S);
-  wMin = Math.max(0, wMin);
-  if (wMax < wMin) wMax = wMin; // ensure feasible
-
-  // Prefer matching current mph, if present
-  if (isFinite(mph) && mph > 0.1){
-    const mphClamped = Math.max(MIN_SPEED, Math.min(MAX_SPEED, mph));
-    const tTarget = (Dmi / mphClamped) * 3600;
-    let wTarget = Math.round((tTarget - rawElapsedS) / ELAPSED_WRAP_13S);
-    if (wTarget < wMin) wTarget = wMin;
-    if (wTarget > wMax) wTarget = wMax;
-    return wTarget;
+  // 2. We need (rawElapsedS + W * 8192) to be somewhere between minTimeSec and maxTimeSec.
+  // Solve for W:
+  //    minTimeSec <= raw + W*8192 <= maxTimeSec
+  //    (minTimeSec - raw) / 8192 <= W <= (maxTimeSec - raw) / 8192
+  
+  const minWraps = Math.ceil((minTimeSec - rawElapsedS) / ELAPSED_WRAP_13S);
+  const maxWraps = Math.floor((maxTimeSec - rawElapsedS) / ELAPSED_WRAP_13S);
+  
+  // If the window is invalid (impossible data), default to 0 or closest valid.
+  if (maxWraps < minWraps) {
+      return Math.max(0, minWraps); 
   }
-  // Otherwise pick minimal wraps that avoid impossible avg (> MAX)
-  return wMin;
+
+  // 3. If there are multiple valid wrap counts (rare, but possible if distance is short),
+  // pick the one that produces an average speed closest to the current instantaneous speed.
+  let bestW = -1;
+  let bestDiff = Infinity;
+  
+  // If current speed is 0 or unknown, assume a leisurely walking pace (1.5 mph) for estimation
+  const targetSpeed = (currentMph > 0.1) ? currentMph : 1.5;
+
+  for (let w = minWraps; w <= maxWraps; w++) {
+      if (w < 0) continue; // Time cannot be negative
+      
+      const totalSeconds = rawElapsedS + (w * ELAPSED_WRAP_13S);
+      const avgSpeed = Dmi / (totalSeconds / 3600);
+      
+      const diff = Math.abs(avgSpeed - targetSpeed);
+      if (diff < bestDiff) {
+          bestDiff = diff;
+          bestW = w;
+      }
+  }
+
+  return Math.max(0, bestW);
 }
 
 /**
- * If avg speed computed with current wrap offset drifts outside bounds,
- * nudge the offset by integer wraps to bring it back. Returns wraps applied (+/-).
+ * Checks if the current wrap offset creates an impossible average speed.
+ * If so, it forces a recalculation using the strict estimator.
  */
-function reconcileWrapOffsetWithDistance(distanceM, rawElapsedS){
+function reconcileWrapOffsetWithDistance(distanceM, rawElapsedS, currentMph){
+  const currentTotalS = rawElapsedS + elapsedWrapOffsetS;
+  if (currentTotalS <= 0) return 0;
+
   const Dmi = milesFromMeters(distanceM);
-  if (!isFinite(Dmi) || Dmi <= 0) return 0;
+  const avgSpeed = Dmi / (currentTotalS / 3600);
 
-  let adjS = rawElapsedS + elapsedWrapOffsetS;
-  if (adjS <= 0) return 0;
-
-  let avg = Dmi / (adjS / 3600);
-
-  // Too fast? (avg > MAX + eps) -> add wraps (increase time)
-  if (avg > MAX_SPEED + AVG_SPEED_EPS){
-    const needS = (Dmi / MAX_SPEED) * 3600 - adjS; // seconds short
-    const addWraps = Math.ceil(needS / ELAPSED_WRAP_13S);
-    if (addWraps > 0){
-      elapsedWrapOffsetS += addWraps * ELAPSED_WRAP_13S;
-      return +addWraps;
-    }
-  }
-
-  // Too slow? (avg < MIN - eps) -> remove wraps (decrease time)
-  if (avg < MIN_SPEED - AVG_SPEED_EPS){
-    const extraS = adjS - (Dmi / MIN_SPEED) * 3600; // seconds too many
-    let subWraps = Math.floor(extraS / ELAPSED_WRAP_13S);
-    if (subWraps > 0){
-      const old = elapsedWrapOffsetS;
-      elapsedWrapOffsetS = Math.max(0, elapsedWrapOffsetS - subWraps * ELAPSED_WRAP_13S);
-      const deltaWraps = Math.round((elapsedWrapOffsetS - old) / ELAPSED_WRAP_13S);
-      return deltaWraps;
-    }
+  // If our current average speed is physically impossible (with a small buffer),
+  // we are definitely on the wrong wrap. Force a fix.
+  // Buffer: allow 0.1 mph variance for start/stop ramp-up
+  if (avgSpeed > (MAX_SPEED + 0.5) || avgSpeed < (MIN_SPEED - 0.2)) {
+      
+      const correctWraps = estimateWrapsFor(distanceM, rawElapsedS, currentMph);
+      const currentWraps = Math.round(elapsedWrapOffsetS / ELAPSED_WRAP_13S);
+      
+      if (correctWraps !== currentWraps) {
+          const diff = correctWraps - currentWraps;
+          elapsedWrapOffsetS = correctWraps * ELAPSED_WRAP_13S;
+          return diff;
+      }
   }
   return 0;
 }
@@ -376,9 +391,9 @@ el.c.onclick=async()=>{
           }
         }
 
-        // NEW: Ongoing reconciliation (rare; guards against +/-1 wrap mis-guess as distance advances)
         if (lastRawElapsedSeenS > 0){
-          const deltaWraps = reconcileWrapOffsetWithDistance(pkt.totalDistanceM, lastRawElapsedSeenS);
+          // We pass 'mph' here so the reconciler knows the target speed
+          const deltaWraps = reconcileWrapOffsetWithDistance(pkt.totalDistanceM, lastRawElapsedSeenS, lastKnownMph);
           if (deltaWraps !== 0){
             const adjS1 = lastRawElapsedSeenS + elapsedWrapOffsetS;
             const ms1 = adjS1 * 1000;
