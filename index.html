@@ -387,7 +387,13 @@
 
         // --- Elapsed time handling (with observed rollovers + attach-time inference) ---
         if (typeof pkt.elapsedTimeS === 'number'){
-          const rawS = pkt.elapsedTimeS;
+          // Treat implausible startup elapsed (near wrap, zero distance) as zero
+          const scaledDistForStaleCheck = (typeof pkt.totalDistanceM === 'number' ? pkt.totalDistanceM * getDistanceScale() : totalDist);
+          let rawS = pkt.elapsedTimeS;
+          if (!running && elapsedWrapOffsetS === 0 && prevRawElapsedS === 0 && scaledDistForStaleCheck < 5 && rawS > ELAPSED_WRAP_THRESHOLD_HIGH) {
+            log(`Reset stale elapsed from device start (${formatHMS(rawS)})`);
+            rawS = 0;
+          }
 
           // NEW: remember latest raw for later reconciliation/estimation
           lastRawElapsedSeenS = rawS;
